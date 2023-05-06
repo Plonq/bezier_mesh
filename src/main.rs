@@ -1,4 +1,3 @@
-use bevy::math::Vec3Swizzles;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy_inspector_egui::prelude::*;
@@ -8,7 +7,7 @@ use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 use bevy_transform_gizmo::{GizmoPickSource, GizmoTransformable, TransformGizmoPlugin};
 use bevy_vector_shapes::prelude::*;
 use itertools::Itertools;
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::{FRAC_1_SQRT_2, TAU};
 
 fn main() {
     App::new()
@@ -17,6 +16,7 @@ fn main() {
             control_points: (0..4)
                 .map(|i| Vec3::new(i as f32 * 3.0, 0.0, 0.0))
                 .collect(),
+            auto_update: true,
             ..default()
         })
         .register_type::<Config>()
@@ -51,9 +51,27 @@ struct Velocity(Vec2);
 #[reflect(Resource, InspectorOptions)]
 struct Config {
     auto_update: bool,
+    #[inspector(min = 2, max = 150)]
     detail: usize,
     control_points: Vec<Vec3>,
     mesh: Option<Handle<Mesh>>,
+}
+
+#[derive(Default)]
+struct Vertex {
+    point: Vec3,
+    normal: Vec3,
+    u_coord: f32,
+}
+
+impl Vertex {
+    fn new(point: Vec3, normal: Vec3, u_coord: f32) -> Self {
+        Vertex {
+            point,
+            normal,
+            u_coord,
+        }
+    }
 }
 
 fn setup(
@@ -111,6 +129,7 @@ fn build_mesh(
     mut materials: ResMut<Assets<StandardMaterial>>,
     point_q: Query<(&ControlPoint, &Transform)>,
     mut config: ResMut<Config>,
+    mut painter: ShapePainter,
 ) {
     if let Some(((_, tfm1), (_, tfm2), (_, tfm3), (_, tfm4))) = point_q
         .iter()
@@ -134,18 +153,36 @@ fn build_mesh(
             })
             .flat_map(|(t, curve_point)| {
                 // Vertices of one slice of road, relative to the point on the curve
+                #[rustfmt::skip]
                 let local_vertices = vec![
-                    Vec3::new(-0.5, 0.3, 0.0),
-                    Vec3::new(-0.3, 0.3, 0.0),
-                    Vec3::new(-0.2, 0.2, 0.0),
-                    Vec3::new(0.2, 0.2, 0.0),
-                    Vec3::new(0.3, 0.3, 0.0),
-                    Vec3::new(0.5, 0.3, 0.0),
-                    Vec3::new(0.5, 0.0, 0.0),
-                    Vec3::new(-0.5, 0.0, 0.0),
+                    // 0
+                    Vertex::new(Vec3::new(-0.5, 0.3, 0.0), Vec3::NEG_X, 0.0),
+                    Vertex::new(Vec3::new(-0.5, 0.3, 0.0), Vec3::Y, 0.0),
+                    // 1
+                    Vertex::new(Vec3::new(-0.3, 0.3, 0.0), Vec3::Y, 0.0),
+                    Vertex::new(Vec3::new(-0.3, 0.3, 0.0), Vec3::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2, 0.0), 0.0),
+                    // 2
+                    Vertex::new(Vec3::new(-0.2, 0.2, 0.0), Vec3::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2, 0.0), 0.0),
+                    Vertex::new(Vec3::new(-0.2, 0.2, 0.0), Vec3::Y, 0.0),
+                    // 3
+                    Vertex::new(Vec3::new(0.2, 0.2, 0.0), Vec3::Y, 0.0),
+                    Vertex::new(Vec3::new(0.2, 0.2, 0.0), Vec3::new(-FRAC_1_SQRT_2, FRAC_1_SQRT_2, 0.0), 0.0),
+                    // 4
+                    Vertex::new(Vec3::new(0.3, 0.3, 0.0), Vec3::new(-FRAC_1_SQRT_2, FRAC_1_SQRT_2, 0.0), 0.0),
+                    Vertex::new(Vec3::new(0.3, 0.3, 0.0), Vec3::Y, 0.0),
+                    // 5
+                    Vertex::new(Vec3::new(0.5, 0.3, 0.0), Vec3::Y, 0.0),
+                    Vertex::new(Vec3::new(0.5, 0.3, 0.0), Vec3::X, 0.0),
+                    // 6
+                    Vertex::new(Vec3::new(0.5, 0.0, 0.0), Vec3::X, 0.0),
+                    Vertex::new(Vec3::new(0.5, 0.0, 0.0), Vec3::NEG_Y, 0.0),
+                    // 7
+                    Vertex::new(Vec3::new(-0.5, 0.0, 0.0), Vec3::NEG_Y, 0.0),
+                    Vertex::new(Vec3::new(-0.5, 0.0, 0.0), Vec3::NEG_X, 0.0),
                 ];
+
                 // Map these local points to world points by adding them to the curve point
-                local_vertices.into_iter().map(move |local_vertex| {
+                local_vertices.into_iter().map(move |mut local_vertex| {
                     let prev = cubic_bezier(
                         tfm1.translation,
                         tfm2.translation,
@@ -164,13 +201,23 @@ fn build_mesh(
                     let local_z = (prev - next).normalize();
                     let local_y = Vec3::Y;
                     let local_x = local_y.cross(local_z).normalize();
-                    // Convert local coordinates to world coordinates
-                    let mut world_vertex = curve_point;
-                    world_vertex += local_vertex.x * local_x;
-                    world_vertex += local_vertex.y * local_y;
-                    world_vertex += local_vertex.z * local_z;
+                    // Convert local point to world point
+                    let mut world_point = curve_point;
+                    world_point += local_vertex.point.x * local_x;
+                    world_point += local_vertex.point.y * local_y;
+                    world_point += local_vertex.point.z * local_z;
+                    local_vertex.point = world_point;
+                    // Convert local normal to world normal (i.e. just rotation)
+                    let mat = Mat4::from_cols(
+                        Vec4::from((local_x, 0.0)),
+                        Vec4::from((local_y, 0.0)),
+                        Vec4::from((local_z, 0.0)),
+                        Vec4::ZERO
 
-                    world_vertex
+                    );
+                    let rotated_normal = mat.transform_vector3(local_vertex.normal);
+                    local_vertex.normal = rotated_normal;
+                    local_vertex
                 })
             })
             .collect::<Vec<_>>();
@@ -192,44 +239,65 @@ fn build_mesh(
         //     ));
         // }
 
+        // Debug normals
+        // painter.thickness = 0.005;
+        // painter.cap = Cap::None;
+        // for v in vertices.iter() {
+        //     let color = Color::rgb(v.normal.x, v.normal.y, v.normal.z);
+        //     let dest = v.point + v.normal * 0.15;
+        //     painter.color = color;
+        //     painter.line(v.point, dest);
+        // }
+
         let mut triangles: Vec<u32> = vec![];
         for i in 0..(config.detail - 1) {
             #[rustfmt::skip]
                 let base_tris: Vec<u32> = vec![
-                0,8,15,
-                0,15,7,
-                0,9,8,
-                0,1,9,
-                1,10,9,
-                1,2,10,
-                2,11,10,
-                2,3,11,
-                3,12,11,
-                3,4,12,
-                4,13,12,
-                4,5,13,
-                5,14,13,
-                5,6,14,
-                6,15,14,
-                6,7,15,
+                0,16,31,
+                1,18,17,
+                1,2,18,
+                3,20,19,
+                3,4,20,
+                5,22,21,
+                5,6,22,
+                7,24,23,
+                7,8,24,
+                9,26,25,
+                9,10,26,
+                11,28,27,
+                11,12,28,
+                13,30,29,
+                13,14,30,
+                15,16,31,
+                15,0,16,
             ];
             for j in base_tris {
-                triangles.push(j + (i * 8) as u32);
+                triangles.push(j + (i * 16) as u32);
             }
         }
 
         if let Some(mesh_handle) = &config.mesh {
             let mesh = meshes.get_mut(mesh_handle).unwrap();
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_POSITION,
+                vertices.iter().map(|v| v.point).collect::<Vec<_>>(),
+            );
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_NORMAL,
+                vertices.iter().map(|v| v.normal).collect::<Vec<_>>(),
+            );
             mesh.set_indices(Some(Indices::U32(triangles)));
-            mesh.duplicate_vertices();
-            mesh.compute_flat_normals();
         } else {
             let mut mesh = Mesh::new(PrimitiveTopology::TriangleList);
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_POSITION,
+                vertices.iter().map(|v| v.point).collect::<Vec<_>>(),
+            );
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_NORMAL,
+                vertices.iter().map(|v| v.normal).collect::<Vec<_>>(),
+            );
             mesh.set_indices(Some(Indices::U32(triangles)));
-            mesh.duplicate_vertices();
-            mesh.compute_flat_normals();
             let handle = meshes.add(mesh);
 
             commands.spawn((
